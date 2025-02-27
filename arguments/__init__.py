@@ -47,6 +47,7 @@ class ParamGroup:
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
+        self.distill_feature_dim = 16
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
@@ -71,6 +72,7 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
+
 class ModelHiddenParams(ParamGroup):
     def __init__(self, parser):
         self.net_width = 64 # width of deformation MLP, larger will increase the rendering quality and decrase the training/rendering speed.
@@ -98,6 +100,7 @@ class ModelHiddenParams(ParamGroup):
         self.no_dr=False # cancel the deformation of Gaussians' rotations
         self.no_do=True # cancel the deformation of Gaussians' opacity
         self.no_dshs=True # cancel the deformation of SH colors.
+        self.no_d_distill_features=False
         self.empty_voxel=False # useless
         self.grid_pe=0 # useless, I was trying to add positional encoding to hexplane's features
         self.static_mlp=False # useless
@@ -111,18 +114,18 @@ class OptimizationParams(ParamGroup):
         self.dataloader=False
         self.zerostamp_init=False
         self.custom_sampler=None
-        self.iterations = 30_000
+        self.iterations = 30000
         self.coarse_iterations = 3000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 20_000
+        self.position_lr_max_steps = 20000
         self.deformation_lr_init = 0.00016
         self.deformation_lr_final = 0.000016
         self.deformation_lr_delay_mult = 0.01
         self.grid_lr_init = 0.0016
         self.grid_lr_final = 0.00016
-
+        self.distill_lr = 0.0025
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
@@ -147,6 +150,11 @@ class OptimizationParams(ParamGroup):
         self.opacity_threshold_fine_after = 0.005
         self.batch_size=1
         self.add_point=False
+
+        # Feature splatting optimization parameters
+        self.update_decoder_until_iter = 5_000
+        self.update_features_until_iter = 5_500
+        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
@@ -155,7 +163,7 @@ def get_combined_args(parser : ArgumentParser):
     args_cmdline = parser.parse_args(cmdlne_string)
 
     try:
-        cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
+        cfgfilepath = os.path.join("/home/jatucker/dyn_gaussians/output/", "cfg_args")
         print("Looking for config file in", cfgfilepath)
         with open(cfgfilepath) as cfg_file:
             print("Config file found: {}".format(cfgfilepath))

@@ -15,7 +15,16 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from time import time as get_time
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None):
+
+def render(viewpoint_camera, pc : GaussianModel, 
+           pipe, 
+           bg_color : torch.Tensor, 
+           scaling_modifier = 1.0, 
+           override_color = None, 
+           stage="fine", 
+           cam_type=None, 
+           render_features = False, 
+           render_gaussian_idx = False):
     """
     Render the scene. 
     
@@ -47,6 +56,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             sh_degree=pc.active_sh_degree,
             campos=viewpoint_camera.camera_center.cuda(),
             prefiltered=False,
+            render_features=render_features,
+            render_gaussian_idx=render_gaussian_idx,
             debug=pipe.debug
         )
         time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
@@ -76,17 +87,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         scales = pc._scaling
         rotations = pc._rotation
+    # Get view-independent features (distill features) for each Gaussian for rendering.
+    distill_feats = pc.get_distill_features    
     deformation_point = pc._deformation_table
     if "coarse" in stage:
-        means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
+        means3D_final, scales_final, rotations_final, opacity_final, shs_final, distill_feats_final = means3D, scales, rotations, opacity, shs, distill_feats
     elif "fine" in stage:
         # time0 = get_time()
         # means3D_deform, scales_deform, rotations_deform, opacity_deform = pc._deformation(means3D[deformation_point], scales[deformation_point], 
         #                                                                  rotations[deformation_point], opacity[deformation_point],
         #                                                                  time[deformation_point])
-        means3D_final, scales_final, rotations_final, opacity_final, shs_final = pc._deformation(means3D, scales, 
+        means3D_final, scales_final, rotations_final, opacity_final, shs_final, distill_feats_final = pc._deformation(means3D, scales, 
                                                                  rotations, opacity, shs,
-                                                                 time)
+                                                                 time, distill_feats)
     else:
         raise NotImplementedError
 
@@ -117,7 +130,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # time3 = get_time()
-    rendered_image, radii, depth = rasterizer(
+    rendered_image, rendered_feat, rendered_depth, rendered_gaussian_idx, radii = rasterizer(
         means3D = means3D_final,
         means2D = means2D,
         shs = shs_final,
@@ -125,15 +138,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacities = opacity,
         scales = scales_final,
         rotations = rotations_final,
-        cov3D_precomp = cov3D_precomp)
+        cov3D_precomp = cov3D_precomp,
+        distill_feats = distill_feats_final)
     # time4 = get_time()
     # print("rasterization:",time4-time3)
     # breakpoint()
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
+            "render_feat": rendered_feat,
             "viewspace_points": screenspace_points,
+            "render_gaussian_idx": rendered_gaussian_idx,
             "visibility_filter" : radii > 0,
             "radii": radii,
-            "depth":depth}
+            "depth":rendered_depth}
 

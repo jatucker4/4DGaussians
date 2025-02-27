@@ -6,6 +6,7 @@ from utils.graphics_utils import fov2focal, focal2fov
 import torch
 from utils.camera_utils import loadCam
 from utils.graphics_utils import focal2fov
+
 class FourDGSdataset(Dataset):
     def __init__(
         self,
@@ -26,6 +27,9 @@ class FourDGSdataset(Dataset):
                 FovX = focal2fov(self.dataset.focal[0], image.shape[2])
                 FovY = focal2fov(self.dataset.focal[0], image.shape[1])
                 mask=None
+                cam = Camera(colmap_id=index,R=R,T=T,FoVx=FovX,FoVy=FovY,image=image,gt_alpha_mask=None,
+                              image_name=f"{index}",uid=index,data_device=torch.device("cuda"),time=time,
+                              mask=mask)
             except:
                 caminfo = self.dataset[index]
                 image = caminfo.image
@@ -36,9 +40,8 @@ class FourDGSdataset(Dataset):
                 time = caminfo.time
     
                 mask = caminfo.mask
-            return Camera(colmap_id=index,R=R,T=T,FoVx=FovX,FoVy=FovY,image=image,gt_alpha_mask=None,
-                              image_name=f"{index}",uid=index,data_device=torch.device("cuda"),time=time,
-                              mask=mask)
+                cam = loadCam(self.args, index, caminfo, 1.0)
+            return cam
         else:
             return self.dataset[index]
     def __len__(self):

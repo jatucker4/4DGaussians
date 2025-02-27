@@ -18,7 +18,8 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", time = 0,
-                 mask = None, depth=None
+                 mask = None, depth=None, depth_scaling_factor=None, depth_cutoff=3.0,
+                 part_feat_chw=None, feat_path=None, feat_chw=None, dino_feat_path=None, dino_feat_chw=None
                  ):
         super(Camera, self).__init__()
 
@@ -29,14 +30,36 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.feat_path = feat_path
+        self.feat_chw = feat_chw
+        self.dino_feat_path = dino_feat_path
+        self.dino_feat_chw = dino_feat_chw
+        self.part_feat_chw = part_feat_chw
         self.time = time
+        self.depth = depth
+        self.mask = mask
         try:
             self.data_device = torch.device(data_device)
         except Exception as e:
             print(e)
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
-        self.original_image = image.clamp(0.0, 1.0)[:3,:,:]
+        
+        if self.mask is not None and self.mask.sum() > 0:
+            self.mask_valid_flag = True
+        else:
+            self.mask_valid_flag = False
+        
+        self.depth_valid_mask = None
+        if self.depth is not None:
+            if depth_scaling_factor is not None:
+                self.depth = self.depth / depth_scaling_factor
+            self.depth[self.depth > depth_cutoff] = 0.0
+            # self.depth = self.depth.to(self.data_device)
+            self.depth_valid_mask = (self.depth > 0).bool()
+            # self.depth_valid_mask = self.depth_valid_mask.to(self.data_device)
+        
+        self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
         # breakpoint()
         # .to(self.data_device)
         self.image_width = self.original_image.shape[2]
@@ -46,7 +69,7 @@ class Camera(nn.Module):
             self.original_image *= gt_alpha_mask
             # .to(self.data_device)
         else:
-            self.original_image *= torch.ones((1, self.image_height, self.image_width))
+            self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
                                                 #   , device=self.data_device)
         self.depth = depth
         self.mask = mask

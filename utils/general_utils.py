@@ -8,7 +8,7 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import gc
 import torch
 import sys
 from datetime import datetime
@@ -18,20 +18,28 @@ import random
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
+# def PILtoTorch(pil_image, resolution):
+#     if resolution is not None:
+#         resized_image_PIL = pil_image.resize(resolution)
+#     else:
+#         resized_image_PIL = pil_image
+#     if np.array(resized_image_PIL).max()!=1:
+#         resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
+#     else:
+#         resized_image = torch.from_numpy(np.array(resized_image_PIL))
+#     if len(resized_image.shape) == 3:
+#         return resized_image.permute(2, 0, 1)
+#     else:
+#         return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+
 def PILtoTorch(pil_image, resolution):
-    if resolution is not None:
-        resized_image_PIL = pil_image.resize(resolution)
-    else:
-        resized_image_PIL = pil_image
-    if np.array(resized_image_PIL).max()!=1:
-        resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
-    else:
-        resized_image = torch.from_numpy(np.array(resized_image_PIL))
+    resized_image_PIL = pil_image.resize(resolution)
+    resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
     if len(resized_image.shape) == 3:
         return resized_image.permute(2, 0, 1)
     else:
         return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
-
+    
 def get_expon_lr_func(
     lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000
 ):
@@ -137,3 +145,8 @@ def safe_state(silent):
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
+
+def pytorch_gc():
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    gc.collect()

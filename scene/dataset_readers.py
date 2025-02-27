@@ -30,6 +30,12 @@ from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.general_utils import PILtoTorch
 from tqdm import tqdm
+
+def is_valid_image(filename):
+    ext_test_flag = any(filename.lower().endswith(extension) for extension in ['.png', '.jpg', '.jpeg'])
+    is_file_flag = os.path.isfile(filename)
+    return ext_test_flag and is_file_flag
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -113,7 +119,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
-        image = PILtoTorch(image,None)
+        # image = PILtoTorch(image,None)
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height,
                               time = float(idx/len(cam_extrinsics)), mask=None) # default by monocular settings.

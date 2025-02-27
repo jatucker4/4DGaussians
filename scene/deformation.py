@@ -61,6 +61,7 @@ class Deformation(nn.Module):
         self.pos_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
         self.scales_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
         self.rotations_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 4))
+        self.distill_features_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 16)) # Add dim
         self.opacity_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 1))
         self.shs_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 16*3))
 
@@ -81,20 +82,23 @@ class Deformation(nn.Module):
  
 
         return hidden
+    
     @property
     def get_empty_ratio(self):
         return self.ratio
-    def forward(self, rays_pts_emb, scales_emb=None, rotations_emb=None, opacity = None,shs_emb=None, time_feature=None, time_emb=None):
+    
+    def forward(self, rays_pts_emb, scales_emb=None, rotations_emb=None, opacity = None,shs_emb=None, time_feature=None, time_emb=None, distill_features=None):
         if time_emb is None:
             return self.forward_static(rays_pts_emb[:,:3])
         else:
-            return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, shs_emb, time_feature, time_emb)
+            return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, shs_emb, time_feature, time_emb, distill_features)
 
     def forward_static(self, rays_pts_emb):
         grid_feature = self.grid(rays_pts_emb[:,:3])
         dx = self.static_mlp(grid_feature)
         return rays_pts_emb[:, :3] + dx
-    def forward_dynamic(self,rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb):
+    
+    def forward_dynamic(self,rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb, distill_features_emb):
         hidden = self.query_time(rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb)
         if self.args.static_mlp:
             mask = self.static_mlp(hidden)
@@ -145,7 +149,15 @@ class Deformation(nn.Module):
             # breakpoint()
             shs = shs_emb*mask.unsqueeze(-1) + dshs
 
-        return pts, scales, rotations, opacity, shs
+        if self.args.no_d_distill_features:
+            distill_features = distill_features_emb
+        else:
+            d_distill_features = self.distill_features_deform(hidden)
+            distill_features = torch.zeros_like(distill_features_emb)
+            distill_features = distill_features_emb*mask + d_distill_features
+
+        return pts, scales, rotations, opacity, shs, distill_features
+    
     def get_mlp_parameters(self):
         parameter_list = []
         for name, param in self.named_parameters():
@@ -158,6 +170,7 @@ class Deformation(nn.Module):
             if  "grid" in name:
                 parameter_list.append(param)
         return parameter_list
+    
 class deform_network(nn.Module):
     def __init__(self, args) :
         super(deform_network, self).__init__()
@@ -182,8 +195,8 @@ class deform_network(nn.Module):
         self.apply(initialize_weights)
         # print(self)
 
-    def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
-        return self.forward_dynamic(point, scales, rotations, opacity, shs, times_sel)
+    def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None, distill_features=None):
+        return self.forward_dynamic(point, scales, rotations, opacity, shs, times_sel, distill_features)
     @property
     def get_aabb(self):
         
@@ -195,23 +208,26 @@ class deform_network(nn.Module):
     def forward_static(self, points):
         points = self.deformation_net(points)
         return points
-    def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
+    def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None, distill_features=None):
         # times_emb = poc_fre(times_sel, self.time_poc)
         point_emb = poc_fre(point,self.pos_poc)
         scales_emb = poc_fre(scales,self.rotation_scaling_poc)
         rotations_emb = poc_fre(rotations,self.rotation_scaling_poc)
         # time_emb = poc_fre(times_sel, self.time_poc)
         # times_feature = self.timenet(time_emb)
-        means3D, scales, rotations, opacity, shs = self.deformation_net( point_emb,
+        means3D, scales, rotations, opacity, shs, distill_features = self.deformation_net( point_emb,
                                                   scales_emb,
                                                 rotations_emb,
                                                 opacity,
                                                 shs,
                                                 None,
-                                                times_sel)
-        return means3D, scales, rotations, opacity, shs
+                                                times_sel,
+                                                distill_features=distill_features)
+        return means3D, scales, rotations, opacity, shs, distill_features
+    
     def get_mlp_parameters(self):
         return self.deformation_net.get_mlp_parameters() + list(self.timenet.parameters())
+    
     def get_grid_parameters(self):
         return self.deformation_net.get_grid_parameters()
 

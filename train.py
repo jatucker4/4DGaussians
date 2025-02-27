@@ -13,10 +13,11 @@ import random
 import os, sys
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss
+import torch.nn.functional as F
+from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss, cosine_loss
 from gaussian_renderer import render, network_gui
 import sys
-from scene import Scene, GaussianModel
+from scene import Scene, GaussianModel, feat_decoder, skip_feat_decoder
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -38,6 +39,7 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, train_iter,timer):
@@ -70,6 +72,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     progress_bar = tqdm(range(first_iter, final_iter), desc="Training progress")
     first_iter += 1
     # lpips_model = lpips.LPIPS(net="alex").cuda()
+    my_feat_decoder = skip_feat_decoder(dataset.distill_feature_dim, part_level=False).cuda()
+    decoder_optimizer = torch.optim.Adam(my_feat_decoder.parameters(), lr=0.001)
+    
     video_cams = scene.getVideoCameras()
     test_cams = scene.getTestCameras()
     train_cams = scene.getTrainCameras()
@@ -136,6 +141,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        gaussians.update_feature_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -177,10 +183,13 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         radii_list = []
         visibility_filter_list = []
         viewspace_point_tensor_list = []
+        render_feature_flag = (iteration < opt.update_features_until_iter)
+        feature_list = []
         for viewpoint_cam in viewpoint_cams:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type, render_features=render_feature_flag)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             images.append(image.unsqueeze(0))
+            rendered_feat = render_pkg["render_feat"]
             if scene.dataset_type!="PanopticSports":
                 gt_image = viewpoint_cam.original_image.cuda()
             else:
@@ -188,6 +197,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             
             gt_images.append(gt_image.unsqueeze(0))
             radii_list.append(radii.unsqueeze(0))
+            feature_list.append(rendered_feat.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
             viewspace_point_tensor_list.append(viewspace_point_tensor)
         
@@ -198,8 +208,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         gt_image_tensor = torch.cat(gt_images,0)
         # Loss
         # breakpoint()
-        Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
-
+        Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:], viewpoint_cam.mask)
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # norm
         
@@ -209,9 +218,64 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             # tv_loss = 0
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
             loss += tv_loss
+
+            # Depth loss
+            if viewpoint_cam.depth is not None:
+                rendered_depth = render_pkg["render_depth"]
+                gt_depth = viewpoint_cam.depth.cuda()
+                if viewpoint_cam.mask is not None:
+                    depth_valid_mask = viewpoint_cam.depth_valid_mask & viewpoint_cam.mask
+                else:
+                    depth_valid_mask = viewpoint_cam.depth_valid_mask
+                depth_loss = l1_loss(rendered_depth, gt_depth, mask=depth_valid_mask)
+                loss = loss + depth_loss
+            if iteration < opt.update_features_until_iter:
+                gt_clip_feat = viewpoint_cam.feat_chw.cuda()
+                gt_dino_feat = viewpoint_cam.dino_feat_chw.cuda()
+                rendered_feat_bhwc = F.interpolate(rendered_feat.unsqueeze(0), size=gt_clip_feat.shape[1:], mode="bilinear", align_corners=False)
+                dino_feat, clip_feat = my_feat_decoder(rendered_feat_bhwc)
+                dino_feat = F.interpolate(dino_feat, size=gt_dino_feat.shape[1:], mode="bilinear", align_corners=False)
+                dino_feat = dino_feat.squeeze(0)
+                clip_feat = clip_feat.squeeze(0)
+
+                ignore_feat_mask = (torch.sum(gt_clip_feat == 0, dim=0) == gt_clip_feat.shape[0])
+                gt_clip_feat[:, ignore_feat_mask] = clip_feat[:, ignore_feat_mask]
+                clip_loss = cosine_loss(clip_feat, gt_clip_feat)
+                dino_loss = cosine_loss(dino_feat, gt_dino_feat)
+                feat_loss = clip_loss + 0.1 * dino_loss
+
+                loss = loss + 0.1 * feat_loss
+
         if opt.lambda_dssim != 0:
             ssim_loss = ssim(image_tensor,gt_image_tensor)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
+            # Depth loss
+            if viewpoint_cam.depth is not None:
+                rendered_depth = render_pkg["render_depth"]
+                gt_depth = viewpoint_cam.depth.cuda()
+                if viewpoint_cam.mask is not None:
+                    depth_valid_mask = viewpoint_cam.depth_valid_mask & viewpoint_cam.mask
+                else:
+                    depth_valid_mask = viewpoint_cam.depth_valid_mask
+                depth_loss = l1_loss(rendered_depth, gt_depth, mask=depth_valid_mask)
+                loss = loss + depth_loss
+
+            if iteration < opt.update_features_until_iter:
+                gt_clip_feat = viewpoint_cam.feat_chw.cuda()
+                gt_dino_feat = viewpoint_cam.dino_feat_chw.cuda()
+                rendered_feat_bhwc = F.interpolate(rendered_feat.unsqueeze(0), size=gt_clip_feat.shape[1:], mode="bilinear", align_corners=False)
+                dino_feat, clip_feat = my_feat_decoder(rendered_feat_bhwc)
+                dino_feat = F.interpolate(dino_feat, size=gt_dino_feat.shape[1:], mode="bilinear", align_corners=False)
+                dino_feat = dino_feat.squeeze(0)
+                clip_feat = clip_feat.squeeze(0)
+
+                ignore_feat_mask = (torch.sum(gt_clip_feat == 0, dim=0) == gt_clip_feat.shape[0])
+                gt_clip_feat[:, ignore_feat_mask] = clip_feat[:, ignore_feat_mask]
+                clip_loss = cosine_loss(clip_feat, gt_clip_feat)
+                dino_loss = cosine_loss(dino_feat, gt_dino_feat)
+                feat_loss = clip_loss + 0.1 * dino_loss
+
+                loss = loss + 0.1 * feat_loss
         # if opt.lambda_lpips !=0:
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
         #     loss += opt.lambda_lpips * lpipsloss
@@ -244,6 +308,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
+                print("[ITER {}] Saving Checkpoint".format(iteration))
+                torch.save(my_feat_decoder.state_dict(), os.path.join(scene.model_path, "feat_decoder.pth"))
             if dataset.render_process:
                 if (iteration < 1000 and iteration % 10 == 9) \
                     or (iteration < 3000 and iteration % 50 == 49) \
@@ -288,16 +354,22 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
             # Optimizer step
             if iteration < opt.iterations:
+                if iteration < opt.update_decoder_until_iter:
+                    decoder_optimizer.step()
+                    decoder_optimizer.zero_grad()
+                    
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
+
+
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname):
     # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
-    gaussians = GaussianModel(dataset.sh_degree, hyper)
+    gaussians = GaussianModel(dataset.sh_degree, dataset.distill_feature_dim,hyper)
     dataset.model_path = args.model_path
     timer = Timer()
     scene = Scene(dataset, gaussians, load_coarse=None)
@@ -389,6 +461,7 @@ def setup_seed(seed):
      np.random.seed(seed)
      random.seed(seed)
      torch.backends.cudnn.deterministic = True
+
 if __name__ == "__main__":
     # Set up command line argument parser
     # torch.set_default_tensor_type('torch.FloatTensor')
@@ -403,13 +476,13 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000,7000,14000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000,7000,14000,20000,30000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[ 14000, 20000, 30_000, 45000, 60000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--expname", type=str, default = "")
-    parser.add_argument("--configs", type=str, default = "")
+    parser.add_argument("--expname", type=str, default = "custom")
+    parser.add_argument("--configs", type=str, default = "4DGaussians/arguments/hypernerf/default.py")
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -419,7 +492,8 @@ if __name__ == "__main__":
         config = mmcv.Config.fromfile(args.configs)
         args = merge_hparams(args, config)
     print("Optimizing " + args.model_path)
-
+    args.source_path = '/home/jatucker/dyn_gaussians/datasets/chicken_processed/colmap'
+    # args.resolution = 2
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
